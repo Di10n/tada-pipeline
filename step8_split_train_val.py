@@ -5,8 +5,8 @@ Reads the existing manifest.json, groups samples by speaker ID (first number
 in the LibriTTS-R filename), assigns ~95% of speakers to train and ~5% to val.
 
 Output:
-  /root/work/data/processed/manifest_train.json
-  /root/work/data/processed/manifest_val.json
+  /workspace/data/processed/manifest_train.json
+  /workspace/data/processed/manifest_val.json
 
 Feature .pt files stay in place — only the manifests change.
 """

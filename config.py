@@ -3,10 +3,10 @@
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-# When running on RunPod, set DATA_ROOT=/root/work/data via env var.
+# When running on RunPod, set DATA_ROOT=/workspace/data via env var.
 import os
 
-DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/root/work/data"))
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/workspace/data"))
 
 RAW_DIR = DATA_ROOT / "raw"
 SEGMENTS_DIR = DATA_ROOT / "segments"

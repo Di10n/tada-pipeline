@@ -6,7 +6,7 @@ then runs the same TADA encoder pipeline (tokenize, align, extract features,
 compute f_before/f_after, quality filter) used for training data.
 
 Output:
-  /root/work/data/test/
+  /workspace/data/test/
     manifest.json
     features/{segment_id}.pt
 """

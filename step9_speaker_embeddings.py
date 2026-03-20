@@ -6,9 +6,9 @@ Uses SpeechBrain's pretrained ECAPA-TDNN (spkrec-ecapa-voxceleb) to extract
 into each sample's .pt feature file under the key "speaker_embedding".
 
 Processes train, val, and test splits. Expects:
-  - /workspace/data/processed/manifest_train.json
-  - /workspace/data/processed/manifest_val.json
-  - /workspace/data/test/manifest.json
+  - /root/work/data/processed/manifest_train.json
+  - /root/work/data/processed/manifest_val.json
+  - /root/work/data/test/manifest.json
   - Original audio segments accessible (LibriTTS-R WAVs)
 """
 

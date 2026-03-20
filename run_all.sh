@@ -8,7 +8,7 @@ cd "$SCRIPT_DIR"
 
 echo "============================================"
 echo "TADA Data Pipeline"
-echo "DATA_ROOT=${DATA_ROOT:-/workspace/data}"
+echo "DATA_ROOT=${DATA_ROOT:-/root/work/data}"
 echo "============================================"
 
 # ── Install dependencies ──────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ python step10_verify_final.py
 echo ""
 echo "============================================"
 echo "Pipeline complete!"
-echo "  Train manifest: ${DATA_ROOT:-/workspace/data}/processed/manifest_train.json"
-echo "  Val manifest:   ${DATA_ROOT:-/workspace/data}/processed/manifest_val.json"
-echo "  Test manifest:  ${DATA_ROOT:-/workspace/data}/test/manifest.json"
+echo "  Train manifest: ${DATA_ROOT:-/root/work/data}/processed/manifest_train.json"
+echo "  Val manifest:   ${DATA_ROOT:-/root/work/data}/processed/manifest_val.json"
+echo "  Test manifest:  ${DATA_ROOT:-/root/work/data}/test/manifest.json"
 echo "============================================"

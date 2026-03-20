@@ -29,6 +29,9 @@ TEST_DIR = DATA_ROOT / "test"
 # ECAPA-TDNN expects 16kHz input
 ECAPA_SR = 16000
 
+BATCH_SIZE = 64
+SAVE_EVERY = 64  # flush pending saves every N embeddings
+
 
 def load_speaker_model(device: str) -> EncoderClassifier:
     """Load pretrained ECAPA-TDNN speaker encoder."""
@@ -40,29 +43,32 @@ def load_speaker_model(device: str) -> EncoderClassifier:
     return spk_model
 
 
-def find_audio_for_segment(segment_id: str, split: str) -> Path | None:
-    """Locate the original audio file for a segment.
-
-    For train/val: look in LibriTTS-R raw/segments directories.
-    For test: look in the downloaded test-clean raw audio.
-    """
+def build_audio_index(split: str) -> dict[str, Path]:
+    """Walk audio directories once and return {stem: path} for all WAVs."""
+    index: dict[str, Path] = {}
     if split == "test":
         raw_test_dir = DATA_ROOT / "raw" / "libritts_r_test"
-        matches = list(raw_test_dir.rglob(f"{segment_id}.wav"))
-        if matches:
-            return matches[0]
+        if raw_test_dir.exists():
+            for p in raw_test_dir.rglob("*.wav"):
+                index[p.stem] = p
     else:
-        # LibriTTS-R segments are the original files — check segments dir first
-        candidate = SEGMENTS_DIR / "libritts_r" / f"{segment_id}.wav"
-        if candidate.exists():
-            return candidate
-        # Fall back to raw dir
+        # Segments dir takes priority over raw dir
         raw_dir = DATA_ROOT / "raw" / "libritts_r"
-        matches = list(raw_dir.rglob(f"{segment_id}.wav"))
-        if matches:
-            return matches[0]
+        if raw_dir.exists():
+            for p in raw_dir.rglob("*.wav"):
+                index[p.stem] = p
+        seg_dir = SEGMENTS_DIR / "libritts_r"
+        if seg_dir.exists():
+            for p in seg_dir.rglob("*.wav"):
+                index[p.stem] = p  # overwrites raw — segments take priority
+    return index
 
-    return None
+
+def flush_pending_saves(pending: list[tuple[Path, dict]]) -> None:
+    """Write accumulated embeddings back to .pt files."""
+    for feature_path, data in pending:
+        torch.save(data, feature_path)
+    pending.clear()
 
 
 def extract_embeddings_for_manifest(
@@ -74,11 +80,55 @@ def extract_embeddings_for_manifest(
     """Extract speaker embeddings for all samples in a manifest."""
     print(f"\n[embed] Processing {split_name}: {len(manifest)} samples")
 
+    print(f"[index] Building audio file index for {split_name}...")
+    audio_index = build_audio_index(split_name)
+    print(f"[index] Found {len(audio_index)} audio files")
+
     done = 0
     skipped = 0
     t0 = time.time()
 
-    for i, entry in enumerate(manifest):
+    # Accumulate a batch of (waveform, feature_path, data_dict) for batched inference
+    batch_waveforms: list[torch.Tensor] = []  # each (1, time) at ECAPA_SR, on device
+    batch_meta: list[tuple[Path, dict]] = []  # (feature_path, loaded data dict)
+
+    # Pending saves: (feature_path, data_dict with embedding added)
+    pending_saves: list[tuple[Path, dict]] = []
+
+    def run_batch() -> int:
+        """Run encoder on accumulated batch, return number of embeddings extracted."""
+        if not batch_waveforms:
+            return 0
+
+        # Pad waveforms to same length for batched inference
+        lengths = [w.shape[1] for w in batch_waveforms]
+        max_len = max(lengths)
+        padded = torch.zeros(len(batch_waveforms), max_len, device=device)
+        for j, w in enumerate(batch_waveforms):
+            padded[j, :w.shape[1]] = w[0]
+
+        # Relative lengths for SpeechBrain (each in [0, 1])
+        rel_lengths = torch.tensor(
+            [l / max_len for l in lengths], device=device, dtype=torch.float32,
+        )
+
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled="cuda" in device,
+        ):
+            embeddings = spk_model.encode_batch(padded, rel_lengths)  # (B, 1, 192)
+
+        embeddings = embeddings.squeeze(1).cpu()  # (B, 192)
+
+        for j, (feature_path, data) in enumerate(batch_meta):
+            data["speaker_embedding"] = embeddings[j]
+            pending_saves.append((feature_path, data))
+
+        count = len(batch_waveforms)
+        batch_waveforms.clear()
+        batch_meta.clear()
+        return count
+
+    for entry in manifest:
         segment_id = entry["segment_id"]
         feature_path = Path(entry["feature_path"])
 
@@ -92,8 +142,8 @@ def extract_embeddings_for_manifest(
             done += 1
             continue
 
-        # Find audio
-        audio_path = find_audio_for_segment(segment_id, split_name)
+        # Find audio via cached index
+        audio_path = audio_index.get(segment_id)
         if audio_path is None:
             if skipped < 5:
                 print(f"  [warn] No audio found for {segment_id}")
@@ -105,22 +155,13 @@ def extract_embeddings_for_manifest(
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
 
-            # Move to device before resampling so resample runs on GPU
             waveform = waveform.to(device)
 
-            # Resample to 16kHz for ECAPA-TDNN
             if sr != ECAPA_SR:
                 waveform = torchaudio.functional.resample(waveform, sr, ECAPA_SR)
 
-            # Extract embedding — SpeechBrain expects (batch, time)
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled="cuda" in device):
-                embedding = spk_model.encode_batch(waveform)  # (1, 1, 192)
-                embedding = embedding.squeeze().cpu()  # (192,)
-
-            # Save back into .pt file
-            data["speaker_embedding"] = embedding
-            torch.save(data, feature_path)
-            done += 1
+            batch_waveforms.append(waveform)
+            batch_meta.append((feature_path, data))
 
         except Exception as e:
             if skipped < 5:
@@ -128,10 +169,22 @@ def extract_embeddings_for_manifest(
             skipped += 1
             continue
 
-        if (done + skipped) % 100 == 0 and (done + skipped) > 0:
-            elapsed = time.time() - t0
-            eta = elapsed / (done + skipped) * (len(manifest) - done - skipped)
-            print(f"  [{done + skipped}/{len(manifest)}] {done} done, {skipped} skipped  ETA {eta/60:.1f}m")
+        # Run batch when full
+        if len(batch_waveforms) >= BATCH_SIZE:
+            done += run_batch()
+
+            # Flush saves periodically
+            if len(pending_saves) >= SAVE_EVERY:
+                flush_pending_saves(pending_saves)
+
+            if (done + skipped) % 100 < BATCH_SIZE:
+                elapsed = time.time() - t0
+                eta = elapsed / (done + skipped) * (len(manifest) - done - skipped)
+                print(f"  [{done + skipped}/{len(manifest)}] {done} done, {skipped} skipped  ETA {eta/60:.1f}m")
+
+    # Process remaining samples
+    done += run_batch()
+    flush_pending_saves(pending_saves)
 
     print(f"[embed] {split_name}: {done} embeddings extracted, {skipped} skipped")
     return done, skipped

@@ -23,6 +23,7 @@ from transformers import AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tada"))
 
 from tada.modules.encoder import Encoder
+from tada.utils.text import normalize_text
 
 from config import (
     SEGMENTS_DIR,
@@ -191,11 +192,26 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
         padded = padded.to(device)
         audio_lengths_dev = audio_lengths.to(device)
 
+        # Pre-tokenize: the encoder's internal pad_sequence is buggy for
+        # batch>1 (2D tensors with varying dim 1). Bypass by passing
+        # text_tokens and text_token_len directly.
+        normalized = [normalize_text(t) for t in texts]
+        tok = encoder.aligner.tokenizer
+        token_seqs = [
+            tok.encode(t, add_special_tokens=False, return_tensors="pt").squeeze(0)
+            for t in normalized
+        ]
+        text_token_len = torch.tensor([t.shape[0] for t in token_seqs], device=device)
+        text_tokens = torch.nn.utils.rnn.pad_sequence(
+            token_seqs, batch_first=True, padding_value=tok.eos_token_id,
+        ).to(device)
+
         try:
             with torch.no_grad():
                 enc_out = encoder(
                     padded,
-                    text=texts,
+                    text_tokens=text_tokens,
+                    text_token_len=text_token_len,
                     audio_length=audio_lengths_dev,
                     sample_rate=sr,
                     sample=False,

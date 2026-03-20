@@ -33,7 +33,7 @@ python step3_transcribe.py
 # ── Step 4: Feature extraction ────────────────────────────────────────────────
 echo ""
 echo "[step 4] Extracting alignments & encoder features..."
-python step4_extract_features.py
+python step4_extract_features.py --workers 8
 
 # ── Step 5: Filter and build ─────────────────────────────────────────────────
 echo ""

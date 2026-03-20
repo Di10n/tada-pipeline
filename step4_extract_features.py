@@ -12,6 +12,7 @@ import csv
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -32,6 +33,7 @@ from config import (
     TOKENIZER_NAME,
     SAMPLE_RATE,
     BATCH_SIZE,
+    NUM_WORKERS,
     FRAME_RATE,
 )
 
@@ -71,6 +73,49 @@ def compute_frame_gaps(positions: torch.Tensor, total_frames: int) -> tuple[torc
     return f_before, f_after
 
 
+def _load_audio(row):
+    """Load and preprocess a single audio file. Returns (row, waveform, sr) or (row, None, error)."""
+    try:
+        waveform, sr = torchaudio.load(row["audio_path"])
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        return row, waveform.squeeze(0), sr  # (samples,)
+    except Exception as e:
+        return row, None, str(e)
+
+
+def _load_batch_audio(batch_rows):
+    """Load audio for a batch using parallel threads."""
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
+        return list(pool.map(_load_audio, batch_rows))
+
+
+def _extract_and_save(segment_id, enc_out, j, audio_len_samples, sr, out_dir):
+    """Extract features for sample j from batched encoder output, save to disk."""
+    token_ids = enc_out.text_tokens[j].cpu()
+    token_positions = enc_out.token_positions[j].cpu()
+    token_values = enc_out.token_values[j].cpu()
+
+    if enc_out.text_tokens_len is not None:
+        tlen = enc_out.text_tokens_len[j].item()
+        token_ids = token_ids[:tlen]
+        token_positions = token_positions[:tlen]
+        token_values = token_values[:tlen]
+
+    total_frames = int(audio_len_samples / sr * FRAME_RATE)
+    f_before, f_after = compute_frame_gaps(token_positions, total_frames)
+
+    sample_dict = {
+        "token_ids": token_ids,
+        "encoder_features": token_values,
+        "positions": token_positions,
+        "f_before": f_before,
+        "f_after": f_after,
+        "duration_frames": total_frames,
+    }
+    torch.save(sample_dict, out_dir / f"{segment_id}.pt")
+
+
 def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str):
     """Extract features for all segments in a dataset."""
     seg_dir = SEGMENTS_DIR / dataset_name
@@ -89,87 +134,112 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
     if processed_log.exists():
         already_done = set(json.loads(processed_log.read_text()))
 
-    print(f"[extract] {dataset_name}: {len(rows)} segments, {len(already_done)} already done")
+    # Filter to unprocessed rows and sort by duration to minimize padding waste
+    todo_rows = [row for row in rows if row["segment_id"] not in already_done]
+    todo_rows.sort(key=lambda r: float(r.get("duration_seconds", 0)))
+    total_todo = len(todo_rows)
+
+    print(f"[extract] {dataset_name}: {len(rows)} segments, {len(already_done)} already done, {total_todo} to process")
+
+    if total_todo == 0:
+        return
 
     newly_done = []
     t0 = time.time()
     processed_count = 0
+    last_progress = 0
+    last_checkpoint = 0
 
-    for i, row in enumerate(rows):
-        segment_id = row["segment_id"]
-        if segment_id in already_done:
+    # Split into batches
+    batches = [todo_rows[i:i + BATCH_SIZE] for i in range(0, total_todo, BATCH_SIZE)]
+
+    # Prefetch: load first batch while we set up
+    prefetch_pool = ThreadPoolExecutor(max_workers=1)
+    next_loaded = prefetch_pool.submit(_load_batch_audio, batches[0])
+
+    for batch_idx, batch_rows in enumerate(batches):
+        # Wait for current batch audio (already loading in background)
+        loaded = next_loaded.result()
+
+        # Start loading next batch while GPU processes this one
+        if batch_idx + 1 < len(batches):
+            next_loaded = prefetch_pool.submit(_load_batch_audio, batches[batch_idx + 1])
+
+        # Separate successes and failures
+        valid = []
+        for row, wav, sr_or_err in loaded:
+            if wav is not None:
+                valid.append((row, wav, sr_or_err))
+            else:
+                print(f"  [error] {row['segment_id']}: {sr_or_err}")
+
+        if not valid:
+            processed_count += len(batch_rows)
             continue
 
-        audio_path = row["audio_path"]
-        transcript = row["transcript_text"]
+        # Build padded batch
+        waveforms = [wav for _, wav, _ in valid]
+        audio_lengths = torch.tensor([w.shape[0] for w in waveforms])
+        texts = [row["transcript_text"] for row, _, _ in valid]
+        sr = valid[0][2]  # LibriTTS-R is all 24kHz
 
-        processed_count += 1
-        if processed_count % 100 == 0:
-            elapsed = time.time() - t0
-            remaining = len(rows) - len(already_done) - processed_count
-            eta = elapsed / processed_count * remaining
-            print(f"  [{i}/{len(rows)}] {segment_id}  ETA {eta/60:.1f}m")
+        max_len = audio_lengths.max().item()
+        padded = torch.zeros(len(waveforms), max_len)
+        for j, w in enumerate(waveforms):
+            padded[j, :w.shape[0]] = w
+
+        padded = padded.to(device)
+        audio_lengths_dev = audio_lengths.to(device)
 
         try:
-            # Load audio
-            waveform, sr = torchaudio.load(audio_path)
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            waveform = waveform.to(device)
-
-            # Run encoder (handles alignment + feature extraction internally)
             with torch.no_grad():
                 enc_out = encoder(
-                    waveform,
-                    text=[transcript],
+                    padded,
+                    text=texts,
+                    audio_length=audio_lengths_dev,
                     sample_rate=sr,
-                    sample=False,  # No noise during extraction — save deterministic mean
+                    sample=False,
                 )
 
-            # Extract outputs (squeeze batch dim)
-            token_ids = enc_out.text_tokens[0].cpu()  # (L,)
-            token_positions = enc_out.token_positions[0].cpu()  # (L,)
-            token_values = enc_out.token_values[0].cpu()  # (L, 512)
-            L = token_ids.shape[0]
-
-            # Trim to actual token length
-            if enc_out.text_tokens_len is not None:
-                tlen = enc_out.text_tokens_len[0].item()
-                token_ids = token_ids[:tlen]
-                token_positions = token_positions[:tlen]
-                token_values = token_values[:tlen]
-                L = tlen
-
-            # Compute total frames from audio duration
-            dur_sec = waveform.shape[1] / sr
-            total_frames = int(dur_sec * FRAME_RATE)
-
-            # Compute f_before, f_after
-            f_before, f_after = compute_frame_gaps(token_positions, total_frames)
-
-            # Duration in frames for the full audio
-            duration_frames = total_frames
-
-            # Save as .pt
-            sample_dict = {
-                "token_ids": token_ids,                # (L,) int
-                "encoder_features": token_values,      # (L, 512) float
-                "positions": token_positions,          # (L,) int
-                "f_before": f_before,                  # (L,) int
-                "f_after": f_after,                    # (L,) int
-                "duration_frames": duration_frames,    # int
-            }
-            torch.save(sample_dict, out_dir / f"{segment_id}.pt")
-            newly_done.append(segment_id)
+            for j, (row, wav, _) in enumerate(valid):
+                try:
+                    _extract_and_save(row["segment_id"], enc_out, j, audio_lengths[j].item(), sr, out_dir)
+                    newly_done.append(row["segment_id"])
+                except Exception as e:
+                    print(f"  [error] {row['segment_id']}: {e}")
 
         except Exception as e:
-            print(f"  [error] {segment_id}: {e}")
-            continue
+            print(f"  [warn] Batch failed ({e}), falling back to sequential")
+            for row, wav, sr_i in valid:
+                try:
+                    with torch.no_grad():
+                        enc_out = encoder(
+                            wav.unsqueeze(0).to(device),
+                            text=[row["transcript_text"]],
+                            sample_rate=sr_i,
+                            sample=False,
+                        )
+                    _extract_and_save(row["segment_id"], enc_out, 0, wav.shape[0], sr_i, out_dir)
+                    newly_done.append(row["segment_id"])
+                except Exception as e2:
+                    print(f"  [error] {row['segment_id']}: {e2}")
 
-        # Checkpoint progress every 500 segments
-        if len(newly_done) % 500 == 0 and newly_done:
+        processed_count += len(batch_rows)
+
+        # Progress every ~100 samples
+        if processed_count - last_progress >= 100:
+            last_progress = processed_count
+            elapsed = time.time() - t0
+            eta = elapsed / processed_count * (total_todo - processed_count)
+            print(f"  [{len(already_done) + processed_count}/{len(rows)}]  ETA {eta/60:.1f}m")
+
+        # Checkpoint every ~500 segments
+        if len(newly_done) - last_checkpoint >= 500:
+            last_checkpoint = len(newly_done)
             all_done = list(already_done | set(newly_done))
             processed_log.write_text(json.dumps(all_done))
+
+    prefetch_pool.shutdown()
 
     # Final checkpoint
     all_done = list(already_done | set(newly_done))

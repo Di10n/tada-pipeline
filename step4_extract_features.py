@@ -296,6 +296,8 @@ def main():
     encoder = Encoder.from_pretrained(TADA_CODEC_REPO, subfolder=ENCODER_SUBFOLDER).to(device)
     encoder.eval()
     if "cuda" in device:
+        import logging
+        logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
         encoder = torch.compile(encoder, mode="default")
         print("[init] torch.compile enabled (first batch will be slow)")
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)

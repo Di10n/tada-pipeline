@@ -33,5 +33,5 @@ MAX_CONSECUTIVE_FRAMES = 3  # max consecutive aligned positions span
 MAX_POSITION_GAP_FRAMES = 150  # ~3 seconds at 50Hz
 
 # ── Processing ─────────────────────────────────────────────────────────────────
-BATCH_SIZE = 16  # batch size for encoder / ASR inference
+BATCH_SIZE = 128  # batch size for encoder / ASR inference
 NUM_WORKERS = 4

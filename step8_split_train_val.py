@@ -13,6 +13,7 @@ Feature .pt files stay in place — only the manifests change.
 
 import json
 import random
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -50,10 +51,13 @@ def split_by_speaker(manifest: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split manifest into train/val by speaker with no speaker overlap."""
     # Enrich manifest entries with token/duration info from .pt files
     print("[split] Enriching manifest with token counts from .pt files...")
+    t0 = time.time()
     for i, entry in enumerate(manifest):
         enrich_entry(entry)
         if i % 100 == 0 and i > 0:
-            print(f"  [{i}/{len(manifest)}]")
+            elapsed = time.time() - t0
+            eta = elapsed / i * (len(manifest) - i)
+            print(f"  [{i}/{len(manifest)}]  ETA {eta/60:.1f}m")
 
     # Group samples by speaker
     speaker_samples = defaultdict(list)

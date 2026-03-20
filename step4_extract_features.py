@@ -11,6 +11,7 @@ Uses the TADA Encoder (which internally runs the Aligner) to extract:
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -91,6 +92,8 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
     print(f"[extract] {dataset_name}: {len(rows)} segments, {len(already_done)} already done")
 
     newly_done = []
+    t0 = time.time()
+    processed_count = 0
 
     for i, row in enumerate(rows):
         segment_id = row["segment_id"]
@@ -100,8 +103,12 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
         audio_path = row["audio_path"]
         transcript = row["transcript_text"]
 
-        if i % 100 == 0:
-            print(f"  [{i}/{len(rows)}] {segment_id}")
+        processed_count += 1
+        if processed_count % 100 == 0:
+            elapsed = time.time() - t0
+            remaining = len(rows) - len(already_done) - processed_count
+            eta = elapsed / processed_count * remaining
+            print(f"  [{i}/{len(rows)}] {segment_id}  ETA {eta/60:.1f}m")
 
         try:
             # Load audio

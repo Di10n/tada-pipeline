@@ -14,6 +14,7 @@ Processes train, val, and test splits. Expects:
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -75,6 +76,7 @@ def extract_embeddings_for_manifest(
 
     done = 0
     skipped = 0
+    t0 = time.time()
 
     for i, entry in enumerate(manifest):
         segment_id = entry["segment_id"]
@@ -124,8 +126,10 @@ def extract_embeddings_for_manifest(
             skipped += 1
             continue
 
-        if (done + skipped) % 100 == 0:
-            print(f"  [{done + skipped}/{len(manifest)}] {done} done, {skipped} skipped")
+        if (done + skipped) % 100 == 0 and (done + skipped) > 0:
+            elapsed = time.time() - t0
+            eta = elapsed / (done + skipped) * (len(manifest) - done - skipped)
+            print(f"  [{done + skipped}/{len(manifest)}] {done} done, {skipped} skipped  ETA {eta/60:.1f}m")
 
     print(f"[embed] {split_name}: {done} embeddings extracted, {skipped} skipped")
     return done, skipped

@@ -6,6 +6,7 @@ Filters out bad samples and builds the final manifest + optional WebDataset shar
 
 import json
 import shutil
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -81,10 +82,13 @@ def filter_and_build(dataset_names: list[str]):
 
         pt_files = sorted(feat_dir.glob("*.pt"))
         print(f"[filter] {ds_name}: {len(pt_files)} feature files")
+        t0 = time.time()
 
         for pt_idx, pt_path in enumerate(pt_files):
-            if pt_idx % 100 == 0:
-                print(f"  [{pt_idx}/{len(pt_files)}]")
+            if pt_idx % 100 == 0 and pt_idx > 0:
+                elapsed = time.time() - t0
+                eta = elapsed / pt_idx * (len(pt_files) - pt_idx)
+                print(f"  [{pt_idx}/{len(pt_files)}]  ETA {eta/60:.1f}m")
             segment_id = pt_path.stem
             if segment_id.startswith("_"):
                 continue  # skip metadata files

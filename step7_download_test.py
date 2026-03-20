@@ -15,6 +15,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 import torch
@@ -126,6 +127,9 @@ def process_test_set(samples: list[dict], encoder: Encoder, device: str):
     newly_done = []
     rejected = 0
 
+    t0 = time.time()
+    processed_count = 0
+
     for i, sample in enumerate(samples):
         segment_id = sample["segment_id"]
 
@@ -143,8 +147,12 @@ def process_test_set(samples: list[dict], encoder: Encoder, device: str):
                 })
             continue
 
-        if i % 100 == 0:
-            print(f"  [{i}/{len(samples)}] {segment_id}")
+        processed_count += 1
+        if processed_count % 100 == 0:
+            elapsed = time.time() - t0
+            remaining = len(samples) - len(already_done) - processed_count
+            eta = elapsed / processed_count * remaining
+            print(f"  [{i}/{len(samples)}] {segment_id}  ETA {eta/60:.1f}m")
 
         try:
             waveform, sr = torchaudio.load(sample["audio_path"])

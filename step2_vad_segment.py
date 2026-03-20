@@ -5,6 +5,7 @@ LibriTTS-R is already segmented — just build manifest, skip segments > 30s or 
 """
 
 import csv
+import time
 from pathlib import Path
 
 import torchaudio
@@ -42,10 +43,13 @@ def process_libritts_r():
     rows = []
     skipped = 0
     all_wavs = sorted(raw_dir.rglob("*.wav"))
+    t0 = time.time()
     # LibriTTS-R structure: {split}/LibriTTS_R/{speaker}/{chapter}/{id}.wav
     for i, wav_path in enumerate(all_wavs):
-        if i % 100 == 0:
-            print(f"  [{i}/{len(all_wavs)}] {wav_path.stem}")
+        if i % 100 == 0 and i > 0:
+            elapsed = time.time() - t0
+            eta = elapsed / i * (len(all_wavs) - i)
+            print(f"  [{i}/{len(all_wavs)}] {wav_path.stem}  ETA {eta/60:.1f}m")
         info = torchaudio.info(str(wav_path))
         dur = info.num_frames / info.sample_rate
         if dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC:

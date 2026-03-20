@@ -105,13 +105,15 @@ def extract_embeddings_for_manifest(
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
 
+            # Move to device before resampling so resample runs on GPU
+            waveform = waveform.to(device)
+
             # Resample to 16kHz for ECAPA-TDNN
             if sr != ECAPA_SR:
                 waveform = torchaudio.functional.resample(waveform, sr, ECAPA_SR)
 
             # Extract embedding — SpeechBrain expects (batch, time)
-            waveform = waveform.to(device)
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled="cuda" in device):
                 embedding = spk_model.encode_batch(waveform)  # (1, 1, 192)
                 embedding = embedding.squeeze().cpu()  # (192,)
 

@@ -207,7 +207,7 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
         ).to(device)
 
         try:
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled="cuda" in device):
                 enc_out = encoder(
                     padded,
                     text_tokens=text_tokens,
@@ -228,7 +228,7 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
             print(f"  [warn] Batch failed ({e}), falling back to sequential")
             for row, wav, sr_i in valid:
                 try:
-                    with torch.no_grad():
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled="cuda" in device):
                         enc_out = encoder(
                             wav.unsqueeze(0).to(device),
                             text=[row["transcript_text"]],
@@ -263,183 +263,20 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
     print(f"[extract] {dataset_name}: {len(newly_done)} new, {len(all_done)} total done")
 
 
-def _worker_fn(worker_id, num_workers, device):
-    """Run feature extraction on a slice of the dataset."""
-    import csv
-
-    print(f"[worker {worker_id}] Loading encoder on {device}...")
-    encoder = Encoder.from_pretrained(TADA_CODEC_REPO, subfolder=ENCODER_SUBFOLDER).to(device)
-    encoder.eval()
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-
-    seg_dir = SEGMENTS_DIR / LIBRITTS_R
-    manifest_path = seg_dir / "manifest_with_text.csv"
-    with open(manifest_path) as f:
-        all_rows = list(csv.DictReader(f))
-
-    # Each worker takes every Nth row (interleaved for even duration distribution)
-    worker_rows = [row for i, row in enumerate(all_rows) if i % num_workers == worker_id]
-    print(f"[worker {worker_id}] Processing {len(worker_rows)} of {len(all_rows)} segments")
-
-    out_dir = FEATURES_DIR / LIBRITTS_R
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Shared checkpoint file — read existing, but each worker tracks its own newly_done
-    processed_log = out_dir / "_processed.json"
-    already_done = set()
-    if processed_log.exists():
-        already_done = set(json.loads(processed_log.read_text()))
-
-    todo_rows = [row for row in worker_rows if row["segment_id"] not in already_done]
-    todo_rows.sort(key=lambda r: float(r.get("duration_seconds", 0)))
-    total_todo = len(todo_rows)
-
-    print(f"[worker {worker_id}] {len(already_done)} already done globally, {total_todo} to process")
-
-    if total_todo == 0:
-        return
-
-    newly_done = []
-    t0 = time.time()
-    processed_count = 0
-    last_progress = 0
-
-    batches = [todo_rows[i:i + BATCH_SIZE] for i in range(0, total_todo, BATCH_SIZE)]
-
-    prefetch_pool = ThreadPoolExecutor(max_workers=1)
-    next_loaded = prefetch_pool.submit(_load_batch_audio, batches[0])
-
-    for batch_idx, batch_rows in enumerate(batches):
-        loaded = next_loaded.result()
-
-        if batch_idx + 1 < len(batches):
-            next_loaded = prefetch_pool.submit(_load_batch_audio, batches[batch_idx + 1])
-
-        valid = []
-        for row, wav, sr_or_err in loaded:
-            if wav is not None:
-                valid.append((row, wav, sr_or_err))
-            else:
-                print(f"  [w{worker_id} error] {row['segment_id']}: {sr_or_err}")
-
-        if not valid:
-            processed_count += len(batch_rows)
-            continue
-
-        waveforms = [wav for _, wav, _ in valid]
-        audio_lengths = torch.tensor([w.shape[0] for w in waveforms])
-        texts = [row["transcript_text"] for row, _, _ in valid]
-        sr = valid[0][2]
-
-        max_len = audio_lengths.max().item()
-        padded = torch.zeros(len(waveforms), max_len)
-        for j, w in enumerate(waveforms):
-            padded[j, :w.shape[0]] = w
-
-        padded = padded.to(device)
-        audio_lengths_dev = audio_lengths.to(device).unsqueeze(1)
-
-        normalized = [normalize_text(t) for t in texts]
-        tok = encoder.aligner.tokenizer
-        token_seqs = [
-            tok.encode(t, add_special_tokens=False, return_tensors="pt").squeeze(0)
-            for t in normalized
-        ]
-        text_token_len = torch.tensor([t.shape[0] for t in token_seqs], device=device)
-        text_tokens = torch.nn.utils.rnn.pad_sequence(
-            token_seqs, batch_first=True, padding_value=tok.eos_token_id,
-        ).to(device)
-
-        try:
-            with torch.no_grad():
-                enc_out = encoder(
-                    padded,
-                    text_tokens=text_tokens,
-                    text_token_len=text_token_len,
-                    audio_length=audio_lengths_dev,
-                    sample_rate=sr,
-                    sample=False,
-                )
-
-            for j, (row, wav, _) in enumerate(valid):
-                try:
-                    _extract_and_save(row["segment_id"], enc_out, j, audio_lengths[j].item(), sr, out_dir)
-                    newly_done.append(row["segment_id"])
-                except Exception as e:
-                    print(f"  [w{worker_id} error] {row['segment_id']}: {e}")
-
-        except Exception as e:
-            for row, wav, sr_i in valid:
-                try:
-                    with torch.no_grad():
-                        enc_out = encoder(
-                            wav.unsqueeze(0).to(device),
-                            text=[row["transcript_text"]],
-                            sample_rate=sr_i,
-                            sample=False,
-                        )
-                    _extract_and_save(row["segment_id"], enc_out, 0, wav.shape[0], sr_i, out_dir)
-                    newly_done.append(row["segment_id"])
-                except Exception as e2:
-                    print(f"  [w{worker_id} error] {row['segment_id']}: {e2}")
-
-        processed_count += len(batch_rows)
-
-        if processed_count - last_progress >= 100:
-            last_progress = processed_count
-            elapsed = time.time() - t0
-            eta = elapsed / processed_count * (total_todo - processed_count)
-            print(f"  [w{worker_id}] {processed_count}/{total_todo}  ETA {eta/60:.1f}m")
-
-        # Write checkpoint (atomic-ish — each worker appends its own progress)
-        if len(newly_done) % 500 < BATCH_SIZE and newly_done:
-            _write_checkpoint(processed_log, already_done, newly_done)
-
-    prefetch_pool.shutdown()
-    _write_checkpoint(processed_log, already_done, newly_done)
-    print(f"[worker {worker_id}] Done: {len(newly_done)} new features extracted")
-
-
-def _write_checkpoint(processed_log, already_done, newly_done):
-    """Merge newly done IDs into checkpoint file (safe for concurrent writers)."""
-    # Re-read to pick up other workers' progress
-    current = set()
-    if processed_log.exists():
-        current = set(json.loads(processed_log.read_text()))
-    current.update(already_done)
-    current.update(newly_done)
-    processed_log.write_text(json.dumps(list(current)))
-
-
 def main():
     import argparse
-    import torch.multiprocessing as mp
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--workers", type=int, default=1,
-                        help="Number of parallel workers (each loads its own encoder)")
     args = parser.parse_args()
 
-    if args.workers <= 1:
-        # Single-worker mode: original path
-        device = args.device
-        print(f"[init] Device: {device}")
-        print("[init] Loading TADA encoder + aligner...")
-        encoder = Encoder.from_pretrained(TADA_CODEC_REPO, subfolder=ENCODER_SUBFOLDER).to(device)
-        encoder.eval()
-        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-        process_dataset(LIBRITTS_R, encoder, tokenizer, device)
-    else:
-        mp.set_start_method("spawn", force=True)
-        print(f"[init] Launching {args.workers} parallel workers on {args.device}")
-        processes = []
-        for w in range(args.workers):
-            p = mp.Process(target=_worker_fn, args=(w, args.workers, args.device))
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
+    device = args.device
+    print(f"[init] Device: {device}")
+    print("[init] Loading TADA encoder + aligner...")
+    encoder = Encoder.from_pretrained(TADA_CODEC_REPO, subfolder=ENCODER_SUBFOLDER).to(device)
+    encoder.eval()
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    process_dataset(LIBRITTS_R, encoder, tokenizer, device)
 
     print("[done] Feature extraction complete.")
 

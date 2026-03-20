@@ -91,8 +91,8 @@ def _load_batch_audio(batch_rows):
         return list(pool.map(_load_audio, batch_rows))
 
 
-def _extract_and_save(segment_id, enc_out, j, audio_len_samples, sr, out_dir):
-    """Extract features for sample j from batched encoder output, save to disk."""
+def _extract_cpu(enc_out, j, audio_len_samples, sr):
+    """Extract features for sample j from batched encoder output, returning CPU tensors."""
     token_ids = enc_out.text_tokens[j].cpu()
     token_positions = enc_out.token_positions[j].cpu()
     token_values = enc_out.token_values[j].cpu()
@@ -106,7 +106,7 @@ def _extract_and_save(segment_id, enc_out, j, audio_len_samples, sr, out_dir):
     total_frames = int(audio_len_samples / sr * FRAME_RATE)
     f_before, f_after = compute_frame_gaps(token_positions, total_frames)
 
-    sample_dict = {
+    return {
         "token_ids": token_ids,
         "encoder_features": token_values,
         "positions": token_positions,
@@ -114,7 +114,11 @@ def _extract_and_save(segment_id, enc_out, j, audio_len_samples, sr, out_dir):
         "f_after": f_after,
         "duration_frames": total_frames,
     }
-    torch.save(sample_dict, out_dir / f"{segment_id}.pt")
+
+
+def _save_pt(sample_dict, path):
+    """Save a sample dict to disk (intended for background thread)."""
+    torch.save(sample_dict, path)
 
 
 def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str):
@@ -150,12 +154,14 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
     processed_count = 0
     last_progress = 0
     last_checkpoint = 0
+    save_futures = []
 
     # Split into batches
     batches = [todo_rows[i:i + BATCH_SIZE] for i in range(0, total_todo, BATCH_SIZE)]
 
     # Prefetch: load first batch while we set up
     prefetch_pool = ThreadPoolExecutor(max_workers=1)
+    save_pool = ThreadPoolExecutor(max_workers=4)
     next_loaded = prefetch_pool.submit(_load_batch_audio, batches[0])
 
     for batch_idx, batch_rows in enumerate(batches):
@@ -219,7 +225,10 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
 
             for j, (row, wav, _) in enumerate(valid):
                 try:
-                    _extract_and_save(row["segment_id"], enc_out, j, audio_lengths[j].item(), sr, out_dir)
+                    sample_dict = _extract_cpu(enc_out, j, audio_lengths[j].item(), sr)
+                    save_futures.append(save_pool.submit(
+                        _save_pt, sample_dict, out_dir / f"{row['segment_id']}.pt"
+                    ))
                     newly_done.append(row["segment_id"])
                 except Exception as e:
                     print(f"  [error] {row['segment_id']}: {e}")
@@ -235,7 +244,10 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
                             sample_rate=sr_i,
                             sample=False,
                         )
-                    _extract_and_save(row["segment_id"], enc_out, 0, wav.shape[0], sr_i, out_dir)
+                    sample_dict = _extract_cpu(enc_out, 0, wav.shape[0], sr_i)
+                    save_futures.append(save_pool.submit(
+                        _save_pt, sample_dict, out_dir / f"{row['segment_id']}.pt"
+                    ))
                     newly_done.append(row["segment_id"])
                 except Exception as e2:
                     print(f"  [error] {row['segment_id']}: {e2}")
@@ -257,6 +269,14 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
 
     prefetch_pool.shutdown()
 
+    # Wait for all background saves to finish
+    for fut in save_futures:
+        exc = fut.exception()
+        if exc is not None:
+            print(f"  [error] background save failed: {exc}")
+
+    save_pool.shutdown()
+
     # Final checkpoint
     all_done = list(already_done | set(newly_done))
     processed_log.write_text(json.dumps(all_done))
@@ -275,6 +295,9 @@ def main():
     print("[init] Loading TADA encoder + aligner...")
     encoder = Encoder.from_pretrained(TADA_CODEC_REPO, subfolder=ENCODER_SUBFOLDER).to(device)
     encoder.eval()
+    if "cuda" in device:
+        encoder = torch.compile(encoder, mode="reduce-overhead")
+        print("[init] torch.compile enabled (first batch will be slow)")
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     process_dataset(LIBRITTS_R, encoder, tokenizer, device)
 

@@ -296,7 +296,7 @@ def main():
     encoder = Encoder.from_pretrained(TADA_CODEC_REPO, subfolder=ENCODER_SUBFOLDER).to(device)
     encoder.eval()
     if "cuda" in device:
-        encoder = torch.compile(encoder, mode="reduce-overhead")
+        encoder = torch.compile(encoder, mode="default")
         print("[init] torch.compile enabled (first batch will be slow)")
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     process_dataset(LIBRITTS_R, encoder, tokenizer, device)

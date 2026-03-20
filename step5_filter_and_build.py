@@ -82,7 +82,9 @@ def filter_and_build(dataset_names: list[str]):
         pt_files = sorted(feat_dir.glob("*.pt"))
         print(f"[filter] {ds_name}: {len(pt_files)} feature files")
 
-        for pt_path in pt_files:
+        for pt_idx, pt_path in enumerate(pt_files):
+            if pt_idx % 100 == 0:
+                print(f"  [{pt_idx}/{len(pt_files)}]")
             segment_id = pt_path.stem
             if segment_id.startswith("_"):
                 continue  # skip metadata files

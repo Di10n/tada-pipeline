@@ -35,7 +35,9 @@ def transcribe_libritts_r():
     result = []
     missing = 0
 
-    for row in rows:
+    for i, row in enumerate(rows):
+        if i % 100 == 0:
+            print(f"  [{i}/{len(rows)}]")
         audio_path = Path(row["audio_path"])
         # Transcript file: same name but .normalized.txt
         txt_path = audio_path.with_suffix(".normalized.txt")

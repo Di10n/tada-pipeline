@@ -41,8 +41,11 @@ def process_libritts_r():
 
     rows = []
     skipped = 0
+    all_wavs = sorted(raw_dir.rglob("*.wav"))
     # LibriTTS-R structure: {split}/LibriTTS_R/{speaker}/{chapter}/{id}.wav
-    for wav_path in sorted(raw_dir.rglob("*.wav")):
+    for i, wav_path in enumerate(all_wavs):
+        if i % 100 == 0:
+            print(f"  [{i}/{len(all_wavs)}] {wav_path.stem}")
         info = torchaudio.info(str(wav_path))
         dur = info.num_frames / info.sample_rate
         if dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC:

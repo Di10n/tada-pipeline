@@ -100,7 +100,7 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
         audio_path = row["audio_path"]
         transcript = row["transcript_text"]
 
-        if i % 200 == 0:
+        if i % 100 == 0:
             print(f"  [{i}/{len(rows)}] {segment_id}")
 
         try:

@@ -52,7 +52,7 @@ def split_by_speaker(manifest: list[dict]) -> tuple[list[dict], list[dict]]:
     print("[split] Enriching manifest with token counts from .pt files...")
     for i, entry in enumerate(manifest):
         enrich_entry(entry)
-        if i % 10000 == 0 and i > 0:
+        if i % 100 == 0 and i > 0:
             print(f"  [{i}/{len(manifest)}]")
 
     # Group samples by speaker

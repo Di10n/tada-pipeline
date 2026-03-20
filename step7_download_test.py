@@ -77,7 +77,10 @@ def discover_test_samples(raw_dir: Path) -> list[dict]:
     samples = []
     skipped = 0
 
-    for wav_path in sorted(raw_dir.rglob("*.wav")):
+    all_wavs = sorted(raw_dir.rglob("*.wav"))
+    for i, wav_path in enumerate(all_wavs):
+        if i % 100 == 0:
+            print(f"  [{i}/{len(all_wavs)}] scanning...")
         # Get duration
         info = torchaudio.info(str(wav_path))
         dur = info.num_frames / info.sample_rate

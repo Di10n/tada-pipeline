@@ -124,7 +124,7 @@ def extract_embeddings_for_manifest(
             skipped += 1
             continue
 
-        if (done + skipped) % 500 == 0:
+        if (done + skipped) % 100 == 0:
             print(f"  [{done + skipped}/{len(manifest)}] {done} done, {skipped} skipped")
 
     print(f"[embed] {split_name}: {done} embeddings extracted, {skipped} skipped")

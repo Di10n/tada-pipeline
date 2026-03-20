@@ -190,7 +190,7 @@ def process_dataset(dataset_name: str, encoder: Encoder, tokenizer, device: str)
             padded[j, :w.shape[0]] = w
 
         padded = padded.to(device)
-        audio_lengths_dev = audio_lengths.to(device)
+        audio_lengths_dev = audio_lengths.to(device).unsqueeze(1)  # (B,1) for aligner broadcast
 
         # Pre-tokenize: the encoder's internal pad_sequence is buggy for
         # batch>1 (2D tensors with varying dim 1). Bypass by passing

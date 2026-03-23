@@ -74,8 +74,8 @@ PROCESSED_DIR = DATA_ROOT / "processed"
 FEATURES_DIR = PROCESSED_DIR / "features"
 
 # Download / upload parallelism
-DOWNLOAD_WORKERS = 128
-UPLOAD_WORKERS = 128
+DOWNLOAD_WORKERS = 256
+UPLOAD_WORKERS = 256
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

@@ -1,13 +1,13 @@
 # Install PyTorch + torchaudio first (CUDA 12.4):
-#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+#   pip install torch==2.7.1 torchaudio --index-url https://download.pytorch.org/whl/cu124
 
-nemo_toolkit[asr]==2.2.1
-hume-tada==0.2.0
+nemo_toolkit[asr]==2.7.1
+hume-tada==0.1.8
 pyannote-audio==3.3.2
 descript-audio-codec==1.0.0
-transformers==4.51.3
-boto3==1.37.27
-tqdm==4.67.1
+transformers==4.57.6
+boto3==1.42.73
+tqdm==4.67.3
 protobuf>=4.21,<5
 onnx>=1.14,<1.17
-onnxruntime-gpu==1.20.1
+onnxruntime-gpu==1.20.0

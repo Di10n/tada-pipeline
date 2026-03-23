@@ -1,9 +1,8 @@
-# Step 1: pip install torch==2.7.1 torchaudio --index-url https://download.pytorch.org/whl/cu124
+# Step 1: pip install torch==2.7.1 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu124
 # Step 2: pip install -r requirements.txt
-# Step 3: pip install --no-deps descript-audio-codec==1.0.0 descript-audiotools==0.7.2
+# Step 3: pip install --no-deps hume-tada==0.1.8 descript-audio-codec==1.0.0 descript-audiotools==0.7.2
 
 nemo_toolkit[asr]==2.7.1
-hume-tada==0.1.8
 pyannote-audio==3.3.2
 transformers==4.57.6
 boto3==1.42.73

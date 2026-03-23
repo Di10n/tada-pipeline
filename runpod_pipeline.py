@@ -68,7 +68,7 @@ TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
 TRAIN_RATIO = 0.95
 SPLIT_SEED = 42
 
-DATA_ROOT = Path("/data")
+DATA_ROOT = Path("/workspace")
 RAW_DIR = DATA_ROOT / "raw"
 PROCESSED_DIR = DATA_ROOT / "processed"
 FEATURES_DIR = PROCESSED_DIR / "features"

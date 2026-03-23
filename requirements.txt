@@ -8,6 +8,6 @@ descript-audio-codec==1.0.0
 transformers==4.57.6
 boto3==1.42.73
 tqdm==4.67.3
-protobuf>=4.21,<5
+protobuf~=5.29.5
 onnx>=1.14,<1.17
 onnxruntime-gpu==1.20.0

@@ -291,6 +291,16 @@ def _gpu_worker(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue):
     Each worker loads all models onto its assigned GPU once, then pulls
     recordings from the shared queue. Results are sent back via result_queue.
     """
+    import traceback
+
+    try:
+        _gpu_worker_inner(gpu_id, file_queue, result_queue)
+    except Exception:
+        print(f"\n  [GPU {gpu_id}] FATAL ERROR:\n{traceback.format_exc()}", flush=True)
+        result_queue.put(("done", None, 0))
+
+
+def _gpu_worker_inner(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue):
     import torch
     import torchaudio
     from tada.utils.text import normalize_text

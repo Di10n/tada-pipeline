@@ -294,8 +294,10 @@ def _gpu_worker(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue):
     import sys
     import traceback
 
+    os.environ["PYTHONUNBUFFERED"] = "1"
     sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
     sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
+    print(f"  [GPU {gpu_id}] Worker started (pid={os.getpid()})", flush=True)
 
     try:
         _gpu_worker_inner(gpu_id, file_queue, result_queue)

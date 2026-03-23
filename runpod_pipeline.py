@@ -294,17 +294,22 @@ def _gpu_worker(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue):
     import sys
     import traceback
 
-    os.environ["PYTHONUNBUFFERED"] = "1"
-    sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
-    sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
-    print(f"  [GPU {gpu_id}] Worker started (pid={os.getpid()})", flush=True)
+    # Redirect this worker's stderr to a log file so errors are never lost
+    log_path = f"/tmp/gpu_worker_{gpu_id}.log"
+    log_file = open(log_path, "w")
+    sys.stderr = log_file
+    sys.stdout = log_file
 
     try:
+        print(f"  [GPU {gpu_id}] Worker started (pid={os.getpid()})", flush=True)
         _gpu_worker_inner(gpu_id, file_queue, result_queue)
     except BaseException as e:
-        traceback.print_exc()
-        print(f"\n  [GPU {gpu_id}] FATAL ERROR: {e}", flush=True)
+        traceback.print_exc(file=log_file)
+        log_file.flush()
         result_queue.put(("done", None, 0))
+    finally:
+        log_file.flush()
+        log_file.close()
 
 
 def _gpu_worker_inner(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue):
@@ -662,6 +667,10 @@ def step_process(mp3_paths: list[str]) -> int:
     print("\n[step 2/6] Processing (VAD → ASR → features)...")
     t0 = time.time()
 
+    # Clear worker logs from previous runs
+    for old_log in Path("/tmp").glob("gpu_worker_*.log"):
+        old_log.unlink()
+
     n_gpus = _count_gpus()
     if n_gpus == 0:
         print("  [error] No GPUs available")
@@ -704,7 +713,13 @@ def step_process(mp3_paths: list[str]) -> int:
     for gpu_id in range(n_gpus):
         p = Process(target=_gpu_worker, args=(gpu_id, file_queue, result_queue))
         p.start()
+        print(f"  Launched GPU {gpu_id} worker (pid={p.pid})", flush=True)
         workers.append(p)
+
+    time.sleep(2)
+    for w in workers:
+        if not w.is_alive():
+            print(f"  [WARNING] Worker pid={w.pid} died with exitcode={w.exitcode}", flush=True)
 
     # Collect results with progress bar
     new_segments = 0

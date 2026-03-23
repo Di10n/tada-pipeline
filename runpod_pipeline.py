@@ -10,7 +10,7 @@ with a thread pool.
 Setup:
     # SSH into your RunPod pod, then:
     apt-get update && apt-get install -y ffmpeg libsndfile1 sox
-    pip install torch==2.7.1 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu124
+    pip install torch==2.7.1 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu126
     pip install -r requirements.txt
     pip install --no-deps hume-tada==0.1.8 descript-audio-codec==1.0.0 descript-audiotools==0.7.2
 
@@ -88,6 +88,41 @@ def _fmt_time(seconds: float) -> str:
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
+
+class _LinearETABar:
+    """Progress bar with ETA = elapsed / fraction_done (linear extrapolation)."""
+
+    def __init__(self, total: int, desc: str = "", unit: str = "it"):
+        from tqdm import tqdm
+
+        self._t0 = time.time()
+        self._bar = tqdm(
+            total=total,
+            desc=desc,
+            unit=unit,
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]",
+        )
+        self._bar.set_postfix_str("--")
+
+    def update(self, n: int = 1):
+        self._bar.update(n)
+        done = self._bar.n
+        total = self._bar.total
+        if done > 0 and total > 0:
+            elapsed = time.time() - self._t0
+            frac = done / total
+            eta = elapsed / frac - elapsed
+            self._bar.set_postfix_str(f"ETA {_fmt_time(eta)}")
+
+    def close(self):
+        self._bar.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 def _get_s3_client():
@@ -228,12 +263,10 @@ def step_download() -> list[str]:
                     return "error"
                 time.sleep(1 * (attempt + 1))
 
-    from tqdm import tqdm
-
     ok = skip = 0
     with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
         futures = {pool.submit(_download_one, obj): obj for obj in objects}
-        with tqdm(total=len(objects), desc="  Downloading", unit="file") as pbar:
+        with _LinearETABar(total=len(objects), desc="  Downloading", unit="file") as pbar:
             for fut in as_completed(futures):
                 result = fut.result()
                 if result == "ok":
@@ -657,11 +690,9 @@ def step_process(mp3_paths: list[str]) -> int:
         workers.append(p)
 
     # Collect results with progress bar
-    from tqdm import tqdm
-
     new_segments = 0
     finished_workers = 0
-    with tqdm(total=len(todo), desc="  Processing", unit="rec") as pbar:
+    with _LinearETABar(total=len(todo), desc="  Processing", unit="rec") as pbar:
         while finished_workers < n_gpus:
             status, rec_id, n = result_queue.get()
             if status == "done":
@@ -733,21 +764,17 @@ def step_filter() -> list[dict]:
     manifest: list[dict] = []
     stats: Counter = Counter()
 
-    from tqdm import tqdm
-
     n_workers = min(os.cpu_count() or 1, len(pt_files))
+    pbar = _LinearETABar(total=len(pt_files), desc="  Filtering", unit="file")
     with Pool(processes=n_workers) as pool:
-        for entry, reason in tqdm(
-            pool.imap_unordered(_filter_one_file, pt_files, chunksize=64),
-            total=len(pt_files),
-            desc="  Filtering",
-            unit="file",
-        ):
+        for entry, reason in pool.imap_unordered(_filter_one_file, pt_files, chunksize=64):
             if entry is not None:
                 manifest.append(entry)
                 stats["kept"] += 1
             elif reason is not None:
                 stats[reason] += 1
+            pbar.update(1)
+    pbar.close()
 
     # Sort by segment_id to restore temporal order within each recording
     manifest.sort(key=lambda e: e["segment_id"])
@@ -986,12 +1013,10 @@ def step_upload():
                     return "error"
                 time.sleep(1 * (attempt + 1))
 
-    from tqdm import tqdm
-
     uploaded = 0
     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
         futures = {pool.submit(_upload_one, f): f for f in todo}
-        with tqdm(total=len(todo), desc="  Uploading", unit="file") as pbar:
+        with _LinearETABar(total=len(todo), desc="  Uploading", unit="file") as pbar:
             for fut in as_completed(futures):
                 result = fut.result()
                 if result == "ok":

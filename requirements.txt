@@ -1,4 +1,4 @@
-# Step 1: pip install torch==2.7.1 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu124
+# Step 1: pip install torch==2.7.1 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu126
 # Step 2: pip install -r requirements.txt
 # Step 3: pip install --no-deps hume-tada==0.1.8 descript-audio-codec==1.0.0 descript-audiotools==0.7.2
 

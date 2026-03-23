@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""TADA Data Pipeline — RunPod multi-GPU version.
+"""TADA Data Pipeline — RunPod single-GPU version.
 
-Replaces the Modal serverless pipeline with a single script optimized for
-a multi-GPU RunPod pod. Each GPU runs an independent worker process that
-loads models once and processes recordings end-to-end (download → VAD →
-ASR → TADA features → save). Downloads and uploads are parallelized
-with a thread pool.
+Processes recordings serially on a single GPU (cuda:0). Models are loaded
+once at the start of processing. Downloads and uploads are parallelized
+with thread pools.
 
 Setup:
     # SSH into your RunPod pod, then:
@@ -30,7 +28,6 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from multiprocessing import Process, Queue
 from pathlib import Path
 from typing import Optional
 
@@ -281,46 +278,46 @@ def step_download() -> list[str]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Step 2 — GPU processing: VAD → ASR → TADA features (multi-GPU)
+# Step 2 — GPU processing: VAD → ASR → TADA features (single-GPU serial)
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def _gpu_worker(gpu_id: int, file_queue: Queue, result_queue: Queue):
-    """Worker process: owns one GPU, processes recordings until queue is empty.
-
-    Each worker loads all models onto its assigned GPU once, then pulls
-    recordings from the shared queue. Results are sent back via result_queue.
-    """
-    import sys
-    import traceback
-
-    # Redirect this worker's stderr to a log file so errors are never lost
-    log_path = f"/tmp/gpu_worker_{gpu_id}.log"
-    log_file = open(log_path, "w")
-    sys.stderr = log_file
-    sys.stdout = log_file
-
-    try:
-        print(f"  [GPU {gpu_id}] Worker started (pid={os.getpid()})", flush=True)
-        _gpu_worker_inner(gpu_id, file_queue, result_queue)
-    except BaseException as e:
-        traceback.print_exc(file=log_file)
-        log_file.flush()
-        result_queue.put(("done", None, 0))
-    finally:
-        log_file.flush()
-        log_file.close()
-
-
-def _gpu_worker_inner(gpu_id: int, file_queue: Queue, result_queue: Queue):
+def step_process(mp3_paths: list[str]) -> int:
+    """Process all recordings serially on cuda:0. Returns total features."""
     import torch
     import torchaudio
     from tada.utils.text import normalize_text
 
-    torch.cuda.set_device(gpu_id)
-    device = torch.device(f"cuda:{gpu_id}")
+    print("\n[step 2/6] Processing (VAD → ASR → features)...")
+    t0 = time.time()
 
-    # ── Load models ──────────────────────────────────────────────────────
+    # ── Resume check ──────────────────────────────────────────────────────
+    out_dir = FEATURES_DIR / DATASET_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+    done = set()
+    already_done_segments = 0
+    for p in out_dir.glob("*.done"):
+        try:
+            data = json.loads(p.read_text())
+            done.add(p.stem)
+            already_done_segments += data.get("n_segments", 0)
+        except Exception:
+            pass
+
+    todo = [p for p in mp3_paths if Path(p).name.split("_")[0] not in done]
+    print(
+        f"  {len(mp3_paths)} recordings: {len(done)} done "
+        f"({already_done_segments} segments), {len(todo)} to process on 1 GPU"
+    )
+
+    if not todo:
+        return already_done_segments
+
+    # ── GPU initialization ────────────────────────────────────────────────
+    torch.backends.cudnn.benchmark = True
+    device = torch.device("cuda:0")
+
+    # ── Load models ───────────────────────────────────────────────────────
     t_load = time.time()
 
     # Pyannote needs weights_only=False for its checkpoints
@@ -369,374 +366,272 @@ def _gpu_worker_inner(gpu_id: int, file_queue: Queue, result_queue: Queue):
     finally:
         torch.load = _orig_load
 
-    print(f"  [GPU {gpu_id}] Models loaded ({time.time() - t_load:.0f}s)")
-
-    out_dir = FEATURES_DIR / DATASET_NAME
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    processed_count = 0
-
-    # ── Process loop ─────────────────────────────────────────────────────
-    while True:
-        mp3_path_str = file_queue.get()
-        if mp3_path_str is None:  # Sentinel — no more work
-            break
-
-        mp3_path = Path(mp3_path_str)
-        mp3_filename = mp3_path.name
-        recording_id = mp3_filename.split("_")[0]
-        t_rec = time.time()
-
-        # Resume check
-        done_marker = out_dir / f"{recording_id}.done"
-        if done_marker.exists():
-            result_queue.put(("skip", recording_id, 0))
-            continue
-
-        # Clean partial previous run
-        for stale in out_dir.glob(f"{recording_id}_*.pt"):
-            stale.unlink()
-
-        # ── 1. Load & resample ───────────────────────────────────────────
-        try:
-            waveform, sr = torchaudio.load(str(mp3_path))
-        except Exception as e:
-            print(f"  [GPU {gpu_id}] {recording_id}: load failed: {e}")
-            done_marker.write_text(json.dumps({"n_segments": 0}))
-            result_queue.put(("error", recording_id, 0))
-            continue
-
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        if sr != SAMPLE_RATE:
-            waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
-            sr = SAMPLE_RATE
-
-        audio_dur = waveform.shape[1] / sr
-
-        # ── 2. VAD ───────────────────────────────────────────────────────
-        vad_output = vad({"waveform": waveform, "sample_rate": sr})
-        raw_segs = [(t.start, t.end) for t in vad_output.get_timeline()]
-        if not raw_segs:
-            done_marker.write_text(json.dumps({"n_segments": 0}))
-            result_queue.put(("empty", recording_id, 0))
-            continue
-
-        # Step 1: Greedy accumulation (soft max = 20s)
-        # Accumulate consecutive VAD intervals into segments targeting ~15s
-        buffers: list[list[tuple[float, float]]] = [[raw_segs[0]]]
-        for s, e in raw_segs[1:]:
-            buf = buffers[-1]
-            candidate_dur = e - buf[0][0]
-            if candidate_dur <= SOFT_MAX_DURATION_SEC:
-                buf.append((s, e))
-            else:
-                buffers.append([(s, e)])
-
-        accumulated = [(buf[0][0], buf[-1][1]) for buf in buffers]
-
-        # Step 2: Split segments exceeding hard max (30s)
-        split_segs: list[tuple[float, float]] = []
-        for s, e in accumulated:
-            dur = e - s
-            if dur <= HARD_MAX_DURATION_SEC:
-                split_segs.append((s, e))
-            else:
-                n = max(1, round(dur / TARGET_DURATION_SEC))
-                cd = dur / n
-                for i in range(n):
-                    split_segs.append((s + i * cd, s + (i + 1) * cd))
-
-        # Step 3: Handle runts (< 5s) — merge with neighbor or discard
-        final_segs: list[tuple[float, float]] = []
-        for s, e in split_segs:
-            dur = e - s
-            if dur >= MIN_DURATION_SEC:
-                final_segs.append((s, e))
-            elif final_segs:
-                # Try merging with previous segment
-                ps, pe = final_segs[-1]
-                if e - ps <= HARD_MAX_DURATION_SEC:
-                    final_segs[-1] = (ps, e)
-                # else discard
-            # leading runt with no previous neighbor — discard
-
-        # Second pass: merge trailing runts that couldn't merge forward
-        # (a runt at position i that was kept, check if next seg can absorb it)
-        cleaned: list[tuple[float, float]] = []
-        for i, (s, e) in enumerate(final_segs):
-            dur = e - s
-            if dur < MIN_DURATION_SEC and cleaned:
-                ps, pe = cleaned[-1]
-                if e - ps <= HARD_MAX_DURATION_SEC:
-                    cleaned[-1] = (ps, e)
-                    continue
-            cleaned.append((s, e))
-        final_segs = [(s, e) for s, e in cleaned if e - s >= MIN_DURATION_SEC]
-
-        if not final_segs:
-            done_marker.write_text(json.dumps({"n_segments": 0}))
-            result_queue.put(("empty", recording_id, 0))
-            continue
-
-        seg_durs = [e - s for s, e in final_segs]
-        print(
-            f"  [GPU {gpu_id}] {recording_id}: {len(seg_durs)} segs, "
-            f"mean={sum(seg_durs)/len(seg_durs):.1f}s, "
-            f"min={min(seg_durs):.1f}s, max={max(seg_durs):.1f}s, "
-            f"total={sum(seg_durs):.1f}s"
-        )
-
-        # Slice waveforms
-        segments: list[tuple[str, torch.Tensor, float]] = []
-        for idx, (s, e) in enumerate(final_segs):
-            ss = int(s * sr)
-            es = min(int(e * sr), waveform.shape[1])
-            seg_wav = waveform[:, ss:es]
-            dur = seg_wav.shape[1] / sr
-            if dur < MIN_DURATION_SEC:
-                continue
-            segments.append((f"{recording_id}_{idx:06d}", seg_wav, dur))
-
-        if not segments:
-            done_marker.write_text(json.dumps({"n_segments": 0}))
-            result_queue.put(("empty", recording_id, 0))
-            continue
-
-        # ── 3. Transcribe ────────────────────────────────────────────────
-        tmpdir = tempfile.mkdtemp()
-        tmp_paths = []
-        for sid, seg_wav, _ in segments:
-            p = os.path.join(tmpdir, f"{sid}.wav")
-            torchaudio.save(p, seg_wav, sr)
-            tmp_paths.append(p)
-
-        try:
-            texts = asr.transcribe(
-                tmp_paths, batch_size=min(len(tmp_paths), BATCH_SIZE)
-            )
-            if isinstance(texts, tuple):
-                texts = texts[0]
-            if hasattr(texts[0], "text"):
-                texts = [t.text for t in texts]
-        except Exception as e:
-            print(f"  [GPU {gpu_id}] ASR batch {recording_id}: {e}; sequential fallback")
-            texts = []
-            for p in tmp_paths:
-                try:
-                    r = asr.transcribe([p], batch_size=1)
-                    if isinstance(r, tuple):
-                        r = r[0]
-                    texts.append(r[0].text if hasattr(r[0], "text") else r[0])
-                except Exception:
-                    texts.append("")
-
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        torch.cuda.empty_cache()
-
-        # Pair with transcriptions, drop empty
-        transcribed: list[tuple[str, torch.Tensor, float, str]] = []
-        for (sid, wav, dur), text in zip(segments, texts):
-            text = text.strip() if isinstance(text, str) else ""
-            if text:
-                transcribed.append((sid, wav, dur, text))
-
-        if not transcribed:
-            done_marker.write_text(json.dumps({"n_segments": 0}))
-            result_queue.put(("empty", recording_id, 0))
-            continue
-
-        # ── 4. Feature extraction (batched) ──────────────────────────────
-        featured: list[tuple[str, torch.Tensor, float, dict]] = []
-
-        for b_start in range(0, len(transcribed), BATCH_SIZE):
-            batch = transcribed[b_start : b_start + BATCH_SIZE]
-
-            wavs = [wav.squeeze(0) for _, wav, _, _ in batch]
-            txts = [text for _, _, _, text in batch]
-            a_lens = torch.tensor([w.shape[0] for w in wavs])
-
-            max_len = int(a_lens.max().item())
-            padded = torch.zeros(len(wavs), max_len)
-            for j, w in enumerate(wavs):
-                padded[j, : w.shape[0]] = w
-            padded = padded.to(device)
-            a_lens_dev = a_lens.to(device).unsqueeze(1)
-
-            normed = [normalize_text(t) for t in txts]
-            tseqs = [
-                tok.encode(t, add_special_tokens=False, return_tensors="pt").squeeze(0)
-                for t in normed
-            ]
-            ttl = torch.tensor([t.shape[0] for t in tseqs], device=device)
-            tt = torch.nn.utils.rnn.pad_sequence(
-                tseqs, batch_first=True, padding_value=tok.eos_token_id
-            ).to(device)
-
-            batch_ok = True
-            try:
-                with torch.no_grad(), torch.autocast(
-                    device_type="cuda", dtype=torch.bfloat16
-                ):
-                    enc_out = encoder(
-                        padded,
-                        text_tokens=tt,
-                        text_token_len=ttl,
-                        audio_length=a_lens_dev,
-                        sample_rate=sr,
-                        sample=False,
-                    )
-                torch.cuda.synchronize()
-                for j, (sid, wav, dur, _text) in enumerate(batch):
-                    try:
-                        sd = _extract_cpu(enc_out, j, int(a_lens[j].item()), sr)
-                        featured.append((sid, wav, dur, sd))
-                    except Exception as e:
-                        print(f"  [GPU {gpu_id}] extract {sid}: {e}")
-            except Exception as e:
-                print(f"  [GPU {gpu_id}] Feature batch failed ({e}), sequential fallback")
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                batch_ok = False
-
-            if not batch_ok:
-                for sid, wav, dur, text in batch:
-                    try:
-                        with torch.no_grad(), torch.autocast(
-                            device_type="cuda", dtype=torch.bfloat16
-                        ):
-                            enc_out = encoder(
-                                wav.to(device),
-                                text=[text],
-                                sample_rate=sr,
-                                sample=False,
-                            )
-                        torch.cuda.synchronize()
-                        sd = _extract_cpu(enc_out, 0, wav.shape[1], sr)
-                        featured.append((sid, wav, dur, sd))
-                    except Exception as e2:
-                        print(f"  [GPU {gpu_id}] {sid}: {e2}")
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-
-        if not featured:
-            done_marker.write_text(json.dumps({"n_segments": 0}))
-            result_queue.put(("empty", recording_id, 0))
-            continue
-
-        # ── 5. Save .pt ──────────────────────────────────────────────────
-        n_saved = 0
-        for sid, _wav, _dur, sd in featured:
-            pt_path = out_dir / f"{sid}.pt"
-            torch.save(sd, pt_path)
-            n_saved += 1
-
-        done_marker.write_text(json.dumps({"n_segments": n_saved}))
-        elapsed = time.time() - t_rec
-        processed_count += 1
-        print(
-            f"  [GPU {gpu_id}] {recording_id}: {audio_dur:.0f}s audio → "
-            f"{n_saved} features  ({elapsed:.1f}s)"
-        )
-        result_queue.put(("ok", recording_id, n_saved))
-
-    result_queue.put(("done", f"gpu_{gpu_id}", processed_count))
-
-
-def _count_gpus() -> int:
-    """Count available NVIDIA GPUs via NVML without initializing CUDA runtime.
-
-    This is critical: if CUDA runtime is initialized before fork(), child
-    processes inherit a corrupted CUDA context and CUDA_VISIBLE_DEVICES
-    set in the child is silently ignored.
-    """
-    import subprocess
-
+    # Try torch.compile for fused kernels and reduced launch overhead
     try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        return len(out.strip().splitlines())
+        encoder = torch.compile(encoder, mode="reduce-overhead")
+        print("  Encoder compiled with torch.compile (reduce-overhead)")
     except Exception:
-        return 0
+        pass
 
+    print(f"  Models loaded ({time.time() - t_load:.0f}s)")
 
-def step_process(mp3_paths: list[str]) -> int:
-    """Distribute recordings across all available GPUs. Returns total features."""
-    print("\n[step 2/6] Processing (VAD → ASR → features)...")
-    t0 = time.time()
-
-    # Clear worker logs from previous runs
-    for old_log in Path("/tmp").glob("gpu_worker_*.log"):
-        old_log.unlink()
-
-    n_gpus = _count_gpus()
-    if n_gpus == 0:
-        print("  [error] No GPUs available")
-        return 0
-
-    # Check which recordings are already done
-    out_dir = FEATURES_DIR / DATASET_NAME
-    out_dir.mkdir(parents=True, exist_ok=True)
-    done = set()
-    already_done_segments = 0
-    for p in out_dir.glob("*.done"):
-        try:
-            data = json.loads(p.read_text())
-            done.add(p.stem)
-            already_done_segments += data.get("n_segments", 0)
-        except Exception:
-            pass
-
-    todo = [p for p in mp3_paths if Path(p).name.split("_")[0] not in done]
-    print(
-        f"  {len(mp3_paths)} recordings: {len(done)} done "
-        f"({already_done_segments} segments), {len(todo)} to process on {n_gpus} GPU(s)"
-    )
-
-    if not todo:
-        return already_done_segments
-
-    # Use Queue (not SimpleQueue) — SimpleQueue uses a pipe that blocks when full
-    file_queue: Queue = Queue()
-    for path in todo:
-        file_queue.put(path)
-    # Add sentinels (one per GPU)
-    for _ in range(n_gpus):
-        file_queue.put(None)
-
-    result_queue: Queue = Queue()
-
-    # Launch one process per GPU
-    workers = []
-    for gpu_id in range(n_gpus):
-        p = Process(target=_gpu_worker, args=(gpu_id, file_queue, result_queue))
-        p.start()
-        print(f"  Launched GPU {gpu_id} worker (pid={p.pid})", flush=True)
-        workers.append(p)
-
-    time.sleep(2)
-    for w in workers:
-        if not w.is_alive():
-            print(f"  [WARNING] Worker pid={w.pid} died with exitcode={w.exitcode}", flush=True)
-
-    # Collect results with progress bar
+    # ── Process recordings ────────────────────────────────────────────────
     new_segments = 0
-    finished_workers = 0
-    with _LinearETABar(total=len(todo), desc="  Processing", unit="rec") as pbar:
-        while finished_workers < n_gpus:
-            status, rec_id, n = result_queue.get()
-            if status == "done":
-                finished_workers += 1
-            else:
-                pbar.update(1)
-                if status == "ok":
-                    new_segments += n
+    sr = SAMPLE_RATE
 
-    for w in workers:
-        w.join()
+    with _LinearETABar(total=len(todo), desc="  Processing", unit="rec") as pbar:
+        for mp3_path_str in todo:
+            mp3_path = Path(mp3_path_str)
+            mp3_filename = mp3_path.name
+            recording_id = mp3_filename.split("_")[0]
+            t_rec = time.time()
+
+            # Resume check
+            done_marker = out_dir / f"{recording_id}.done"
+            if done_marker.exists():
+                pbar.update(1)
+                continue
+
+            # Clean partial previous run
+            for stale in out_dir.glob(f"{recording_id}_*.pt"):
+                stale.unlink()
+
+            # ── 1. Load & resample ──────────────────────────────────────
+            try:
+                waveform, orig_sr = torchaudio.load(str(mp3_path))
+            except Exception as e:
+                print(f"  {recording_id}: load failed: {e}")
+                done_marker.write_text(json.dumps({"n_segments": 0}))
+                pbar.update(1)
+                continue
+
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            if orig_sr != SAMPLE_RATE:
+                waveform = torchaudio.functional.resample(waveform, orig_sr, SAMPLE_RATE)
+
+            audio_dur = waveform.shape[1] / sr
+
+            # ── 2. VAD ──────────────────────────────────────────────────
+            vad_output = vad({"waveform": waveform, "sample_rate": sr})
+            raw_segs = [(t.start, t.end) for t in vad_output.get_timeline()]
+            if not raw_segs:
+                done_marker.write_text(json.dumps({"n_segments": 0}))
+                pbar.update(1)
+                continue
+
+            # Step 1: Greedy accumulation (soft max = 20s)
+            buffers: list[list[tuple[float, float]]] = [[raw_segs[0]]]
+            for s, e in raw_segs[1:]:
+                buf = buffers[-1]
+                candidate_dur = e - buf[0][0]
+                if candidate_dur <= SOFT_MAX_DURATION_SEC:
+                    buf.append((s, e))
+                else:
+                    buffers.append([(s, e)])
+
+            accumulated = [(buf[0][0], buf[-1][1]) for buf in buffers]
+
+            # Step 2: Split segments exceeding hard max (30s)
+            split_segs: list[tuple[float, float]] = []
+            for s, e in accumulated:
+                dur = e - s
+                if dur <= HARD_MAX_DURATION_SEC:
+                    split_segs.append((s, e))
+                else:
+                    n = max(1, round(dur / TARGET_DURATION_SEC))
+                    cd = dur / n
+                    for i in range(n):
+                        split_segs.append((s + i * cd, s + (i + 1) * cd))
+
+            # Step 3: Handle runts (< 5s) — merge with neighbor or discard
+            final_segs: list[tuple[float, float]] = []
+            for s, e in split_segs:
+                dur = e - s
+                if dur >= MIN_DURATION_SEC:
+                    final_segs.append((s, e))
+                elif final_segs:
+                    ps, pe = final_segs[-1]
+                    if e - ps <= HARD_MAX_DURATION_SEC:
+                        final_segs[-1] = (ps, e)
+
+            # Second pass: merge trailing runts
+            cleaned: list[tuple[float, float]] = []
+            for i, (s, e) in enumerate(final_segs):
+                dur = e - s
+                if dur < MIN_DURATION_SEC and cleaned:
+                    ps, pe = cleaned[-1]
+                    if e - ps <= HARD_MAX_DURATION_SEC:
+                        cleaned[-1] = (ps, e)
+                        continue
+                cleaned.append((s, e))
+            final_segs = [(s, e) for s, e in cleaned if e - s >= MIN_DURATION_SEC]
+
+            if not final_segs:
+                done_marker.write_text(json.dumps({"n_segments": 0}))
+                pbar.update(1)
+                continue
+
+            seg_durs = [e - s for s, e in final_segs]
+            print(
+                f"  {recording_id}: {len(seg_durs)} segs, "
+                f"mean={sum(seg_durs)/len(seg_durs):.1f}s, "
+                f"min={min(seg_durs):.1f}s, max={max(seg_durs):.1f}s, "
+                f"total={sum(seg_durs):.1f}s"
+            )
+
+            # Slice waveforms
+            segments: list[tuple[str, torch.Tensor, float]] = []
+            for idx, (s, e) in enumerate(final_segs):
+                ss = int(s * sr)
+                es = min(int(e * sr), waveform.shape[1])
+                seg_wav = waveform[:, ss:es]
+                dur = seg_wav.shape[1] / sr
+                if dur < MIN_DURATION_SEC:
+                    continue
+                segments.append((f"{recording_id}_{idx:06d}", seg_wav, dur))
+
+            if not segments:
+                done_marker.write_text(json.dumps({"n_segments": 0}))
+                pbar.update(1)
+                continue
+
+            # ── 3. Transcribe ───────────────────────────────────────────
+            tmpdir = tempfile.mkdtemp()
+            tmp_paths = []
+            for sid, seg_wav, _ in segments:
+                p = os.path.join(tmpdir, f"{sid}.wav")
+                torchaudio.save(p, seg_wav, sr)
+                tmp_paths.append(p)
+
+            try:
+                texts = asr.transcribe(
+                    tmp_paths, batch_size=min(len(tmp_paths), BATCH_SIZE)
+                )
+                if isinstance(texts, tuple):
+                    texts = texts[0]
+                if hasattr(texts[0], "text"):
+                    texts = [t.text for t in texts]
+            except Exception as e:
+                print(f"  ASR batch {recording_id}: {e}; sequential fallback")
+                texts = []
+                for p in tmp_paths:
+                    try:
+                        r = asr.transcribe([p], batch_size=1)
+                        if isinstance(r, tuple):
+                            r = r[0]
+                        texts.append(r[0].text if hasattr(r[0], "text") else r[0])
+                    except Exception:
+                        texts.append("")
+
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            torch.cuda.empty_cache()
+
+            # Pair with transcriptions, drop empty
+            transcribed: list[tuple[str, torch.Tensor, float, str]] = []
+            for (sid, wav, dur), text in zip(segments, texts):
+                text = text.strip() if isinstance(text, str) else ""
+                if text:
+                    transcribed.append((sid, wav, dur, text))
+
+            if not transcribed:
+                done_marker.write_text(json.dumps({"n_segments": 0}))
+                pbar.update(1)
+                continue
+
+            # ── 4. Feature extraction (batched) ─────────────────────────
+            featured: list[tuple[str, torch.Tensor, float, dict]] = []
+
+            for b_start in range(0, len(transcribed), BATCH_SIZE):
+                batch = transcribed[b_start : b_start + BATCH_SIZE]
+
+                wavs = [wav.squeeze(0) for _, wav, _, _ in batch]
+                txts = [text for _, _, _, text in batch]
+                a_lens = torch.tensor([w.shape[0] for w in wavs])
+
+                max_len = int(a_lens.max().item())
+                padded = torch.zeros(len(wavs), max_len, pin_memory=True)
+                for j, w in enumerate(wavs):
+                    padded[j, : w.shape[0]] = w
+                padded = padded.to(device, non_blocking=True)
+                a_lens_dev = a_lens.to(device, non_blocking=True).unsqueeze(1)
+
+                normed = [normalize_text(t) for t in txts]
+                tseqs = [
+                    tok.encode(t, add_special_tokens=False, return_tensors="pt").squeeze(0)
+                    for t in normed
+                ]
+                ttl = torch.tensor([t.shape[0] for t in tseqs], device=device)
+                tt = torch.nn.utils.rnn.pad_sequence(
+                    tseqs, batch_first=True, padding_value=tok.eos_token_id
+                ).to(device, non_blocking=True)
+
+                batch_ok = True
+                try:
+                    with torch.no_grad(), torch.autocast(
+                        device_type="cuda", dtype=torch.bfloat16
+                    ):
+                        enc_out = encoder(
+                            padded,
+                            text_tokens=tt,
+                            text_token_len=ttl,
+                            audio_length=a_lens_dev,
+                            sample_rate=sr,
+                            sample=False,
+                        )
+                    torch.cuda.synchronize()
+                    for j, (sid, wav, dur, _text) in enumerate(batch):
+                        try:
+                            sd = _extract_cpu(enc_out, j, int(a_lens[j].item()), sr)
+                            featured.append((sid, wav, dur, sd))
+                        except Exception as e:
+                            print(f"  extract {sid}: {e}")
+                except Exception as e:
+                    print(f"  Feature batch failed ({e}), sequential fallback")
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    batch_ok = False
+
+                if not batch_ok:
+                    for sid, wav, dur, text in batch:
+                        try:
+                            with torch.no_grad(), torch.autocast(
+                                device_type="cuda", dtype=torch.bfloat16
+                            ):
+                                enc_out = encoder(
+                                    wav.to(device),
+                                    text=[text],
+                                    sample_rate=sr,
+                                    sample=False,
+                                )
+                            torch.cuda.synchronize()
+                            sd = _extract_cpu(enc_out, 0, wav.shape[1], sr)
+                            featured.append((sid, wav, dur, sd))
+                        except Exception as e2:
+                            print(f"  {sid}: {e2}")
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+
+            if not featured:
+                done_marker.write_text(json.dumps({"n_segments": 0}))
+                pbar.update(1)
+                continue
+
+            # ── 5. Save .pt ─────────────────────────────────────────────
+            n_saved = 0
+            for sid, _wav, _dur, sd in featured:
+                pt_path = out_dir / f"{sid}.pt"
+                torch.save(sd, pt_path)
+                n_saved += 1
+
+            done_marker.write_text(json.dumps({"n_segments": n_saved}))
+            elapsed = time.time() - t_rec
+            new_segments += n_saved
+            print(
+                f"  {recording_id}: {audio_dur:.0f}s audio → "
+                f"{n_saved} features  ({elapsed:.1f}s)"
+            )
+            pbar.update(1)
 
     total = already_done_segments + new_segments
     print(
@@ -1070,7 +965,7 @@ def main():
     pipeline_start = time.time()
 
     print("=" * 60)
-    print("TADA Data Pipeline (RunPod multi-GPU)")
+    print("TADA Data Pipeline (RunPod single-GPU)")
     print("=" * 60)
 
     # Step 1: Download
@@ -1079,7 +974,7 @@ def main():
         print("[error] No audio files — aborting.")
         return
 
-    # Step 2: GPU processing (multi-GPU parallel)
+    # Step 2: GPU processing (single-GPU serial)
     total_features = step_process(mp3_paths)
     if total_features == 0:
         print("[error] No features produced — aborting.")
@@ -1108,6 +1003,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.set_start_method("spawn")
     main()

@@ -698,8 +698,8 @@ def step_process(mp3_paths: list[str]) -> int:
     if not todo:
         return already_done_segments
 
-    # Fill work queue
-    file_queue: SimpleQueue = SimpleQueue()
+    # Use Queue (not SimpleQueue) — SimpleQueue uses a pipe that blocks when full
+    file_queue: Queue = Queue()
     for path in todo:
         file_queue.put(path)
     # Add sentinels (one per GPU)

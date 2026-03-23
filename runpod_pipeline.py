@@ -10,8 +10,9 @@ with a thread pool.
 Setup:
     # SSH into your RunPod pod, then:
     apt-get update && apt-get install -y ffmpeg libsndfile1 sox
-    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+    pip install torch==2.7.1 torchaudio --index-url https://download.pytorch.org/whl/cu124
     pip install -r requirements.txt
+    pip install --no-deps descript-audio-codec==1.0.0 descript-audiotools==0.7.2
 
     # Copy .env to the pod (or export the variables)
     # Required: R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, HF_TOKEN

@@ -30,7 +30,7 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from multiprocessing import Process, Queue, SimpleQueue
+from multiprocessing import Process, Queue
 from pathlib import Path
 from typing import Optional
 
@@ -285,7 +285,7 @@ def step_download() -> list[str]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def _gpu_worker(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue):
+def _gpu_worker(gpu_id: int, file_queue: Queue, result_queue: Queue):
     """Worker process: owns one GPU, processes recordings until queue is empty.
 
     Each worker loads all models onto its assigned GPU once, then pulls
@@ -312,13 +312,13 @@ def _gpu_worker(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue):
         log_file.close()
 
 
-def _gpu_worker_inner(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue):
+def _gpu_worker_inner(gpu_id: int, file_queue: Queue, result_queue: Queue):
     import torch
     import torchaudio
     from tada.utils.text import normalize_text
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    device = torch.device("cuda")
+    torch.cuda.set_device(gpu_id)
+    device = torch.device(f"cuda:{gpu_id}")
 
     # ── Load models ──────────────────────────────────────────────────────
     t_load = time.time()
@@ -344,6 +344,7 @@ def _gpu_worker_inner(gpu_id: int, file_queue: SimpleQueue, result_queue: Queue)
         import nemo.collections.asr as nemo_asr
 
         asr = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
+        asr = asr.to(device)
         asr.eval()
 
         # DAC snake activation JIT fix

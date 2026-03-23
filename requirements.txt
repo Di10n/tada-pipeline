@@ -10,3 +10,4 @@ boto3==1.37.27
 tqdm==4.67.1
 protobuf>=4.21,<5
 onnx>=1.14,<1.17
+onnxruntime-gpu==1.20.1

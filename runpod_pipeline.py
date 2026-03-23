@@ -11,8 +11,7 @@ Setup:
     # SSH into your RunPod pod, then:
     apt-get update && apt-get install -y ffmpeg libsndfile1 sox
     pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
-    pip install 'nemo_toolkit[asr]' hume-tada pyannote-audio \
-        transformers boto3 tqdm 'protobuf>=4.21,<5' 'onnx>=1.14,<1.17'
+    pip install -r requirements.txt
 
     # Copy .env to the pod (or export the variables)
     # Required: R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, HF_TOKEN

@@ -1,4 +1,4 @@
-# Step 1: pip install torch==2.7.1 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu126
+# Step 1: pip install torch==2.8.0 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu128
 # Step 2: pip install -r requirements.txt
 # Step 3: pip install --no-deps hume-tada==0.1.8 descript-audio-codec==1.0.0 descript-audiotools==0.7.2
 
@@ -11,7 +11,7 @@ tensorboard==2.20.0
 tensorboardX==2.6.4
 protobuf~=5.29.5
 onnx>=1.14,<1.17
-onnxruntime-gpu==1.20.0
+onnxruntime-gpu==1.24.4
 
 # descript-audiotools deps (installed separately via --no-deps due to protobuf conflict)
 flatten_dict

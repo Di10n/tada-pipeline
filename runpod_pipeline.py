@@ -8,7 +8,7 @@ with thread pools.
 Setup:
     # SSH into your RunPod pod, then:
     apt-get update && apt-get install -y ffmpeg libsndfile1 sox
-    pip install torch==2.7.1 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu126
+    pip install torch==2.8.0 torchaudio torchvision --index-url https://download.pytorch.org/whl/cu128
     pip install -r requirements.txt
     pip install --no-deps hume-tada==0.1.8 descript-audio-codec==1.0.0 descript-audiotools==0.7.2
 
@@ -23,12 +23,12 @@ import functools
 import json
 import os
 import random
-import shutil
-import tempfile
+import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Queue
 from typing import Optional
 
 # ── Load .env if present ─────────────────────────────────────────────────────
@@ -47,6 +47,7 @@ if _env_path.exists():
 # ── Constants ────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 24_000
+ASR_SAMPLE_RATE = 16_000
 MIN_DURATION_SEC = 5.0
 TARGET_DURATION_SEC = 15.0
 SOFT_MAX_DURATION_SEC = 20.0
@@ -134,6 +135,16 @@ def _get_s3_client():
     )
 
 
+_thread_local = threading.local()
+
+
+def _get_thread_s3_client():
+    """Return a per-thread cached S3 client (boto3 clients aren't thread-safe)."""
+    if not hasattr(_thread_local, "s3"):
+        _thread_local.s3 = _get_s3_client()
+    return _thread_local.s3
+
+
 def _check_quality(sample: dict) -> Optional[str]:
     """Return rejection reason or None if sample passes."""
     import torch
@@ -170,17 +181,10 @@ def _check_quality(sample: dict) -> Optional[str]:
 def _compute_frame_gaps(positions, total_frames):
     import torch
 
-    L = positions.shape[0]
-    f_before = torch.zeros(L, dtype=torch.long)
-    f_after = torch.zeros(L, dtype=torch.long)
+    f_before = torch.diff(positions, prepend=torch.tensor([0], dtype=positions.dtype))
+    f_before[1:] -= 1  # diff already gives gap+1 for non-first elements
 
-    f_before[0] = positions[0]
-    for i in range(1, L):
-        f_before[i] = positions[i] - positions[i - 1] - 1
-
-    for i in range(L - 1):
-        f_after[i] = positions[i + 1] - positions[i] - 1
-    f_after[L - 1] = total_frames - 1 - positions[L - 1]
+    f_after = torch.diff(positions, append=torch.tensor([total_frames], dtype=positions.dtype)) - 1
 
     return f_before.clamp(min=0), f_after.clamp(min=0)
 
@@ -248,10 +252,9 @@ def step_download() -> list[str]:
         dest = raw_dir / filename
         if dest.exists() and dest.stat().st_size == obj["size"]:
             return "skip"
-        # Each thread gets its own S3 client (boto3 clients aren't thread-safe)
         for attempt in range(3):
             try:
-                client = _get_s3_client()
+                client = _get_thread_s3_client()
                 client.download_file(bucket, key, str(dest))
                 return "ok"
             except Exception as e:
@@ -379,8 +382,31 @@ def step_process(mp3_paths: list[str]) -> int:
     new_segments = 0
     sr = SAMPLE_RATE
 
+    # Prefetch: load & resample the next recording while GPU works on current
+    prefetch_q: Queue = Queue(maxsize=2)
+
+    def _prefetch_worker():
+        for p in todo:
+            try:
+                wav, orig_sr = torchaudio.load(p)
+                if wav.shape[0] > 1:
+                    wav = wav.mean(dim=0, keepdim=True)
+                if orig_sr != SAMPLE_RATE:
+                    wav = torchaudio.functional.resample(wav, orig_sr, SAMPLE_RATE)
+                prefetch_q.put((p, wav, None))
+            except Exception as exc:
+                prefetch_q.put((p, None, exc))
+        prefetch_q.put(None)  # sentinel
+
+    prefetch_thread = threading.Thread(target=_prefetch_worker, daemon=True)
+    prefetch_thread.start()
+
     with _LinearETABar(total=len(todo), desc="  Processing", unit="rec") as pbar:
-        for mp3_path_str in todo:
+        while True:
+            item = prefetch_q.get()
+            if item is None:
+                break
+            mp3_path_str, waveform, load_error = item
             mp3_path = Path(mp3_path_str)
             mp3_filename = mp3_path.name
             recording_id = mp3_filename.split("_")[0]
@@ -396,19 +422,11 @@ def step_process(mp3_paths: list[str]) -> int:
             for stale in out_dir.glob(f"{recording_id}_*.pt"):
                 stale.unlink()
 
-            # ── 1. Load & resample ──────────────────────────────────────
-            try:
-                waveform, orig_sr = torchaudio.load(str(mp3_path))
-            except Exception as e:
-                print(f"  {recording_id}: load failed: {e}")
+            if load_error is not None:
+                print(f"  {recording_id}: load failed: {load_error}")
                 done_marker.write_text(json.dumps({"n_segments": 0}))
                 pbar.update(1)
                 continue
-
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            if orig_sr != SAMPLE_RATE:
-                waveform = torchaudio.functional.resample(waveform, orig_sr, SAMPLE_RATE)
 
             audio_dur = waveform.shape[1] / sr
 
@@ -496,17 +514,17 @@ def step_process(mp3_paths: list[str]) -> int:
                 pbar.update(1)
                 continue
 
-            # ── 3. Transcribe ───────────────────────────────────────────
-            tmpdir = tempfile.mkdtemp()
-            tmp_paths = []
-            for sid, seg_wav, _ in segments:
-                p = os.path.join(tmpdir, f"{sid}.wav")
-                torchaudio.save(p, seg_wav, sr)
-                tmp_paths.append(p)
+            # ── 3. Transcribe (pass tensors directly, no temp files) ──
+            asr_wavs = []
+            for _, seg_wav, _ in segments:
+                w = seg_wav.squeeze(0)  # [1, T] → [T]
+                if sr != ASR_SAMPLE_RATE:
+                    w = torchaudio.functional.resample(w, sr, ASR_SAMPLE_RATE)
+                asr_wavs.append(w)
 
             try:
                 texts = asr.transcribe(
-                    tmp_paths, batch_size=min(len(tmp_paths), BATCH_SIZE)
+                    asr_wavs, batch_size=min(len(asr_wavs), BATCH_SIZE)
                 )
                 if isinstance(texts, tuple):
                     texts = texts[0]
@@ -515,16 +533,15 @@ def step_process(mp3_paths: list[str]) -> int:
             except Exception as e:
                 print(f"  ASR batch {recording_id}: {e}; sequential fallback")
                 texts = []
-                for p in tmp_paths:
+                for w in asr_wavs:
                     try:
-                        r = asr.transcribe([p], batch_size=1)
+                        r = asr.transcribe([w], batch_size=1)
                         if isinstance(r, tuple):
                             r = r[0]
                         texts.append(r[0].text if hasattr(r[0], "text") else r[0])
                     except Exception:
                         texts.append("")
 
-            shutil.rmtree(tmpdir, ignore_errors=True)
             torch.cuda.empty_cache()
 
             # Pair with transcriptions, drop empty
@@ -932,7 +949,7 @@ def step_upload():
     def _upload_one(file_info: dict) -> str:
         for attempt in range(3):
             try:
-                client = _get_s3_client()
+                client = _get_thread_s3_client()
                 client.upload_file(file_info["local"], bucket, file_info["key"])
                 return "ok"
             except Exception as e:
